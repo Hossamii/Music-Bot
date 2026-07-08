@@ -10,9 +10,12 @@ correctly without crashing.
 from __future__ import annotations
 
 import asyncio
+import ctypes.util
+import glob
 import io
 import logging
 import os
+import subprocess
 import sys
 
 import discord
@@ -32,6 +35,47 @@ logging.basicConfig(
 log = logging.getLogger("music.bot")
 
 TOKEN = os.environ.get("DISCORD_BOT_TOKEN")
+
+
+def _ensure_opus_loaded() -> None:
+    """Load libopus explicitly. On Nix-based environments (like this Repl),
+    shared libraries installed via the package manager live under
+    /nix/store/<hash>-libopus-<version>/lib and are NOT on the default
+    dynamic linker search path, so discord.py's automatic
+    ctypes.util.find_library('opus') lookup fails silently and voice
+    playback raises `OpusNotLoaded` the first time a track is played.
+    This searches a few known locations and falls back to a Nix store scan."""
+    if discord.opus.is_loaded():
+        return
+
+    candidates = [ctypes.util.find_library("opus"), "libopus.so.0", "libopus.so"]
+    for candidate in candidates:
+        if not candidate:
+            continue
+        try:
+            discord.opus.load_opus(candidate)
+            if discord.opus.is_loaded():
+                log.info("Loaded opus library: %s", candidate)
+                return
+        except OSError:
+            continue
+
+    # Fall back to scanning the Nix store directly for a libopus build.
+    for pattern in ("/nix/store/*-libopus-*/lib/libopus.so.0", "/nix/store/*-libopus-*/lib/libopus.so"):
+        matches = sorted(glob.glob(pattern))
+        for match in matches:
+            try:
+                discord.opus.load_opus(match)
+                if discord.opus.is_loaded():
+                    log.info("Loaded opus library from Nix store: %s", match)
+                    return
+            except OSError:
+                continue
+
+    log.error(
+        "Opus status: NOT LOADED — voice playback will fail with OpusNotLoaded. "
+        "Ensure 'libopus' is installed as a system dependency."
+    )
 
 INTENTS = discord.Intents.default()
 INTENTS.voice_states = True
@@ -71,6 +115,26 @@ async def on_app_command_error(interaction: discord.Interaction, error: discord.
         pass
 
 
+def _update_ytdlp() -> None:
+    """Best-effort upgrade of yt-dlp on startup. YouTube frequently changes
+    its player/cipher code, and an outdated yt-dlp is the #1 cause of
+    playback failures — so we always try to pull the latest release before
+    starting. Never blocks startup on failure (e.g. offline, firewalled)."""
+    try:
+        result = subprocess.run(
+            [sys.executable, "-m", "pip", "install", "--upgrade", "--quiet", "yt-dlp"],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        if result.returncode == 0:
+            log.info("yt-dlp is up to date.")
+        else:
+            log.warning("yt-dlp auto-update exited with code %d: %s", result.returncode, result.stderr.strip())
+    except Exception:  # noqa: BLE001 - never let an update failure stop the bot
+        log.exception("yt-dlp auto-update failed; continuing with the currently installed version.")
+
+
 async def main() -> None:
     if not TOKEN:
         log.error(
@@ -79,6 +143,8 @@ async def main() -> None:
         )
         return
 
+    _update_ytdlp()
+    _ensure_opus_loaded()
     keep_alive()
 
     async with bot:

@@ -106,20 +106,45 @@ class Music(commands.Cog):
                     await self._notify(state, f"Skipping **{next_track.title}** — {exc}")
                     continue
                 except Exception:  # noqa: BLE001 - report unexpected errors, never crash the bot
-                    log.exception("Unexpected playback error")
-                    await self._notify(state, f"Skipping **{next_track.title}** — unexpected playback error.")
+                    # Print the exact traceback to the console for debugging,
+                    # but never let it crash the bot or a slash command.
+                    log.exception("Unexpected error resolving/building audio source for %r", next_track.title)
+                    await self._notify(
+                        state,
+                        f"Skipping **{next_track.title}** — an unexpected error occurred while loading it "
+                        "(see the bot console for details).",
+                    )
                     continue
 
                 def _after(error: Exception | None) -> None:
                     if error:
-                        log.error("Playback error: %s", error)
+                        log.error("Playback error for %r: %s", next_track.title, error)
                     self._play_next(guild)
 
                 try:
                     state.voice_client.play(source, after=_after)
+                except discord.opus.OpusNotLoaded:
+                    log.exception(
+                        "libopus is not loaded — voice playback cannot start. "
+                        "Ensure the 'libopus' system dependency is installed."
+                    )
+                    await self._notify(
+                        state,
+                        f"Couldn't play **{next_track.title}** — the audio codec (libopus) isn't loaded on the "
+                        "server. This is a bot configuration issue, not your fault.",
+                    )
+                    return
                 except discord.ClientException:
                     # Something else started playback concurrently; don't double-start.
                     log.warning("play() rejected — playback already in progress for guild %s", guild.id)
+                    return
+                except Exception:  # noqa: BLE001 - never let an unexpected playback error crash the bot
+                    log.exception("Unexpected error starting playback for %r", next_track.title)
+                    await self._notify(
+                        state,
+                        f"Couldn't play **{next_track.title}** — an unexpected error occurred "
+                        "(see the bot console for details).",
+                    )
                     return
                 await self._notify(state, f"Now playing: **{next_track.title}** ({next_track.formatted_duration()})")
                 return
