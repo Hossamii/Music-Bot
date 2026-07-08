@@ -11,6 +11,27 @@ env = { "CI" = "true" }
 [workflows]
 runButton = "Project"
 
+[[workflows.workflow]]
+name = "Project"
+mode = "parallel"
+author = "agent"
+
+[[workflows.workflow.tasks]]
+task = "workflow.run"
+args = "Discord Music Bot"
+
+[[workflows.workflow]]
+name = "Discord Music Bot"
+author = "agent"
+
+[workflows.workflow.metadata]
+outputType = "console"
+
+[[workflows.workflow.tasks]]
+task = "shell.exec"
+args = "cd discord-music-bot && python bot.py"
+waitForPort = 8000
+
 [agent]
 stack = "PNPM_WORKSPACE"
 expertMode = true

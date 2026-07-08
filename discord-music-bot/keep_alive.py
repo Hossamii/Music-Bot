@@ -7,6 +7,7 @@ background thread so it never blocks the Discord bot's event loop.
 """
 
 import logging
+import os
 import threading
 
 from flask import Flask
@@ -29,13 +30,26 @@ def health():
     return {"status": "ok"}
 
 
-def _run():
-    # Port 8080 is proxied by Replit automatically.
-    app.run(host="0.0.0.0", port=8080)
+# Configurable so this never collides with another service's port; defaults
+# to 8000, which is reserved for this bot's workflow.
+KEEP_ALIVE_PORT = int(os.environ.get("KEEP_ALIVE_PORT", "8000"))
+
+
+def _run(port: int):
+    try:
+        app.run(host="0.0.0.0", port=port)
+    except OSError:
+        log.exception(
+            "keep_alive server failed to bind to port %d (already in use?). "
+            "The Discord bot will keep running regardless.",
+            port,
+        )
 
 
 def keep_alive():
-    """Start the Flask keep-alive server in a background thread."""
-    thread = threading.Thread(target=_run, daemon=True)
+    """Start the Flask keep-alive server in a background thread. Runs as a
+    daemon thread so it never blocks bot shutdown, and failures here are
+    logged but never crash the bot itself."""
+    thread = threading.Thread(target=_run, args=(KEEP_ALIVE_PORT,), daemon=True)
     thread.start()
-    log.info("keep_alive server started on port 8080")
+    log.info("keep_alive server starting on port %d", KEEP_ALIVE_PORT)

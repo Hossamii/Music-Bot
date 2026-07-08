@@ -1,0 +1,2 @@
+- [Discord.py voice requires davey](discord-py-voice-davey.md) — discord.py 2.7+ needs the `davey` PyPI package (DAVE E2EE), not just PyNaCl, or VoiceClient raises RuntimeError.
+- [Non-artifact background services](non-artifact-background-services.md) — bots/scripts that don't fit an artifact type get their own `configureWorkflow`, not `createArtifact`.

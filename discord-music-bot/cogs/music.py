@@ -25,6 +25,10 @@ SOURCE_CHOICES = [
 
 
 class Music(commands.Cog):
+    """Music playback commands. All commands are decorated with
+    @app_commands.guild_only() since playback doesn't make sense in DMs and
+    interaction.guild_id / user.voice would be None there."""
+
     def __init__(self, bot: commands.Bot):
         self.bot = bot
         self.manager = MusicManager()
@@ -77,36 +81,48 @@ class Music(commands.Cog):
             log.exception("Error advancing queue for guild %s", guild.id)
 
     async def _advance_queue(self, guild: discord.Guild) -> None:
+        """Pop and start the next track. Iterates (never recurses) so a
+        chain of unavailable tracks can't hold `play_next_lock` forever
+        across nested awaits (asyncio.Lock is not reentrant)."""
         state = self._state(guild.id)
         async with state.play_next_lock:
-            next_track = state.pop_next()
-            state.current = next_track
-            if next_track is None:
-                return
+            while True:
+                next_track = state.pop_next()
+                state.current = next_track
+                if next_track is None:
+                    return
 
-            if state.voice_client is None or not state.voice_client.is_connected():
-                return
+                if state.voice_client is None or not state.voice_client.is_connected():
+                    return
 
-            try:
-                stream_url = await YTDLSource.refresh_stream_url(next_track)
-                source = YTDLSource.build_audio_source(stream_url, state.volume)
-            except TrackUnavailableError as exc:
-                await self._notify(state, f"Skipping **{next_track.title}** — {exc}")
-                await self._advance_queue(guild)
-                return
-            except Exception as exc:  # noqa: BLE001 - report unexpected errors, never crash the bot
-                log.exception("Unexpected playback error")
-                await self._notify(state, f"Skipping **{next_track.title}** — unexpected playback error.")
-                await self._advance_queue(guild)
-                return
+                # Never start a second stream on top of one already playing.
+                if state.voice_client.is_playing() or state.voice_client.is_paused():
+                    return
 
-            def _after(error: Exception | None) -> None:
-                if error:
-                    log.error("Playback error: %s", error)
-                self._play_next(guild)
+                try:
+                    stream_url = await YTDLSource.refresh_stream_url(next_track)
+                    source = YTDLSource.build_audio_source(stream_url, state.volume)
+                except TrackUnavailableError as exc:
+                    await self._notify(state, f"Skipping **{next_track.title}** — {exc}")
+                    continue
+                except Exception:  # noqa: BLE001 - report unexpected errors, never crash the bot
+                    log.exception("Unexpected playback error")
+                    await self._notify(state, f"Skipping **{next_track.title}** — unexpected playback error.")
+                    continue
 
-            state.voice_client.play(source, after=_after)
-            await self._notify(state, f"Now playing: **{next_track.title}** ({next_track.formatted_duration()})")
+                def _after(error: Exception | None) -> None:
+                    if error:
+                        log.error("Playback error: %s", error)
+                    self._play_next(guild)
+
+                try:
+                    state.voice_client.play(source, after=_after)
+                except discord.ClientException:
+                    # Something else started playback concurrently; don't double-start.
+                    log.warning("play() rejected — playback already in progress for guild %s", guild.id)
+                    return
+                await self._notify(state, f"Now playing: **{next_track.title}** ({next_track.formatted_duration()})")
+                return
 
     async def _notify(self, state: GuildMusicState, message: str) -> None:
         if state.text_channel is not None:
@@ -118,6 +134,7 @@ class Music(commands.Cog):
     # ---------- commands ----------
 
     @app_commands.command(name="join", description="Join your current voice channel")
+    @app_commands.guild_only()
     async def join(self, interaction: discord.Interaction):
         voice_client = await self._ensure_voice(interaction)
         if voice_client is None:
@@ -125,6 +142,7 @@ class Music(commands.Cog):
         await interaction.response.send_message(f"Joined **{voice_client.channel.name}**.")
 
     @app_commands.command(name="leave", description="Leave the voice channel and clear the queue")
+    @app_commands.guild_only()
     async def leave(self, interaction: discord.Interaction):
         state = self._state(interaction.guild_id)
         if state.voice_client is None or not state.voice_client.is_connected():
@@ -139,6 +157,7 @@ class Music(commands.Cog):
     @app_commands.command(name="play", description="Play a song by search term or URL")
     @app_commands.describe(query="Song name, artist, or a direct YouTube/SoundCloud URL", source="Where to search when not a URL")
     @app_commands.choices(source=SOURCE_CHOICES)
+    @app_commands.guild_only()
     async def play(
         self,
         interaction: discord.Interaction,
@@ -172,14 +191,22 @@ class Music(commands.Cog):
             )
             return
 
+        # Snapshot "was something already playing" before enqueueing so the
+        # followup message is accurate. The actual start decision happens
+        # atomically inside _advance_queue's lock below, so even if two
+        # /play calls race here, only one of them will ever start playback.
+        already_playing = state.is_playing()
         position = state.add(track)
 
-        if state.is_playing():
+        if already_playing:
             await interaction.followup.send(
                 f"Queued **{track.title}** ({track.formatted_duration()}) — position {position}."
             )
         else:
             await interaction.followup.send(f"Loading **{track.title}**...")
+            # Safe to call even if another concurrent /play already started
+            # playback: _advance_queue no-ops if the voice client is already
+            # playing/paused by the time it acquires the lock.
             await self._advance_queue(interaction.guild)
 
     async def _ensure_voice_deferred(self, interaction: discord.Interaction) -> discord.VoiceClient | None:
@@ -208,6 +235,7 @@ class Music(commands.Cog):
         return voice_client
 
     @app_commands.command(name="pause", description="Pause the current track")
+    @app_commands.guild_only()
     async def pause(self, interaction: discord.Interaction):
         state = self._state(interaction.guild_id)
         if not state.voice_client or not state.voice_client.is_playing():
@@ -217,6 +245,7 @@ class Music(commands.Cog):
         await interaction.response.send_message("Paused.")
 
     @app_commands.command(name="resume", description="Resume playback")
+    @app_commands.guild_only()
     async def resume(self, interaction: discord.Interaction):
         state = self._state(interaction.guild_id)
         if not state.voice_client or not state.voice_client.is_paused():
@@ -226,6 +255,7 @@ class Music(commands.Cog):
         await interaction.response.send_message("Resumed.")
 
     @app_commands.command(name="skip", description="Skip the current track")
+    @app_commands.guild_only()
     async def skip(self, interaction: discord.Interaction):
         state = self._state(interaction.guild_id)
         if not state.voice_client or not (state.voice_client.is_playing() or state.voice_client.is_paused()):
@@ -236,6 +266,7 @@ class Music(commands.Cog):
         await interaction.response.send_message(f"Skipped **{skipped}**.")
 
     @app_commands.command(name="stop", description="Stop playback and clear the queue")
+    @app_commands.guild_only()
     async def stop(self, interaction: discord.Interaction):
         state = self._state(interaction.guild_id)
         state.clear()
@@ -244,6 +275,7 @@ class Music(commands.Cog):
         await interaction.response.send_message("Stopped and cleared the queue.")
 
     @app_commands.command(name="queue", description="Show the upcoming songs")
+    @app_commands.guild_only()
     async def queue(self, interaction: discord.Interaction):
         state = self._state(interaction.guild_id)
         lines = []
@@ -263,6 +295,7 @@ class Music(commands.Cog):
         await interaction.response.send_message("\n".join(lines))
 
     @app_commands.command(name="nowplaying", description="Show the currently playing track")
+    @app_commands.guild_only()
     async def nowplaying(self, interaction: discord.Interaction):
         state = self._state(interaction.guild_id)
         if not state.current:
@@ -278,6 +311,7 @@ class Music(commands.Cog):
 
     @app_commands.command(name="volume", description="Set the playback volume (0-200%)")
     @app_commands.describe(level="Volume percentage from 0 to 200")
+    @app_commands.guild_only()
     async def volume(self, interaction: discord.Interaction, level: app_commands.Range[int, 0, 200]):
         state = self._state(interaction.guild_id)
         state.volume = level / 100
