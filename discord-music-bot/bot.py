@@ -82,19 +82,33 @@ INTENTS.voice_states = True
 INTENTS.guilds = True
 INTENTS.message_content = True
 
-bot = commands.Bot(command_prefix="!", intents=INTENTS)
+# No prefix at all — commands are plain words at the start of a message,
+# e.g. "play believer imagine dragons" or just "skip". Slash commands are
+# intentionally not used in this bot.
+bot = commands.Bot(command_prefix="", intents=INTENTS, case_insensitive=True, help_command=None)
 
 
 @bot.event
 async def on_ready():
     log.info("Logged in as %s (id: %s)", bot.user, bot.user.id)
+    # Clears out any slash commands registered by a previous version of the
+    # bot, since this version uses plain text commands instead.
     try:
         synced = await bot.tree.sync()
-        log.info("Synced %d slash command(s).", len(synced))
+        log.info("Synced %d slash command(s) (expected 0 — this bot uses text commands).", len(synced))
     except discord.HTTPException:
         log.exception("Failed to sync slash commands")
-    activity = discord.Activity(type=discord.ActivityType.listening, name="/play")
+    activity = discord.Activity(type=discord.ActivityType.listening, name="play <song>")
     await bot.change_presence(activity=activity)
+
+
+@bot.event
+async def on_message(message: discord.Message):
+    # Never react to other bots (or ourselves) — important since there's no
+    # prefix, so every message is a potential command match.
+    if message.author.bot:
+        return
+    await bot.process_commands(message)
 
 
 @bot.event
@@ -102,15 +116,20 @@ async def on_disconnect():
     log.warning("Bot disconnected from Discord gateway — will attempt to reconnect.")
 
 
-@bot.tree.error
-async def on_app_command_error(interaction: discord.Interaction, error: discord.app_commands.AppCommandError):
-    log.error("Slash command error in /%s: %s", interaction.command.name if interaction.command else "?", error)
-    message = "Something went wrong running that command. Please try again."
+@bot.event
+async def on_command_error(ctx: commands.Context, error: commands.CommandError):
+    if isinstance(error, commands.CommandNotFound):
+        # Expected constantly: with no prefix, every normal chat message
+        # that doesn't happen to start with a command word ends up here.
+        return
+    if isinstance(error, commands.MissingPermissions):
+        await ctx.send("You need Administrator permission to do that.")
+        return
+    if isinstance(error, commands.NoPrivateMessage):
+        return
+    log.error("Command error in %s: %s", ctx.command.name if ctx.command else "?", error)
     try:
-        if interaction.response.is_done():
-            await interaction.followup.send(message, ephemeral=True)
-        else:
-            await interaction.response.send_message(message, ephemeral=True)
+        await ctx.send("Something went wrong running that command. Please try again.")
     except discord.HTTPException:
         pass
 
