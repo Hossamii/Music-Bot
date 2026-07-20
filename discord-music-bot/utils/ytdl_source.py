@@ -45,10 +45,32 @@ COOKIES_FILE = os.environ.get(
     os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "cookies.txt"),
 )
 
+
+def _normalize_netscape_cookies(raw: str) -> str:
+    """Repair common damage that happens when a cookies.txt file is pasted
+    into a single-line env var UI (e.g. Railway's variable editor):
+      - literal backslash-n sequences instead of real newlines
+      - missing/garbled '# Netscape HTTP Cookie File' header, which
+        Python's http.cookiejar parser requires to accept the file
+    """
+    text = raw.strip()
+    # If there are no real newlines but there are literal "\n" sequences,
+    # the paste flattened the file onto one line — unflatten it. Tabs
+    # (the column separator in this format) can get the same treatment.
+    if "\n" not in text and "\\n" in text:
+        text = text.replace("\\n", "\n")
+    if "\t" not in text and "\\t" in text:
+        text = text.replace("\\t", "\t")
+    text = text.replace("\r\n", "\n").strip()
+    if not text.startswith("# Netscape HTTP Cookie File") and not text.startswith("# HTTP Cookie File"):
+        text = "# Netscape HTTP Cookie File\n" + text
+    return text + "\n"
+
+
 if _COOKIES_ENV:
     _tmp_cookies_path = os.path.join(tempfile.gettempdir(), "yt_dlp_cookies.txt")
     with open(_tmp_cookies_path, "w", encoding="utf-8") as _f:
-        _f.write(_COOKIES_ENV)
+        _f.write(_normalize_netscape_cookies(_COOKIES_ENV))
     COOKIES_FILE = _tmp_cookies_path
     log.info("Wrote YouTube cookies from YTDLP_COOKIES env var to %s", COOKIES_FILE)
 
