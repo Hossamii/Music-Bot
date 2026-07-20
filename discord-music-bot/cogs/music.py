@@ -9,10 +9,12 @@ from __future__ import annotations
 import asyncio
 import logging
 
+import aiohttp
 import discord
 from discord import app_commands
 from discord.ext import commands
 
+from utils.lyrics import LyricsNotFoundError, fetch_lyrics, split_artist_title
 from utils.queue_manager import GuildMusicState, MusicManager, Track
 from utils.ytdl_source import TrackUnavailableError, YTDLSource
 
@@ -22,6 +24,39 @@ SOURCE_CHOICES = [
     app_commands.Choice(name="YouTube", value="youtube"),
     app_commands.Choice(name="SoundCloud", value="soundcloud"),
 ]
+
+# FFmpeg `-af` equalizer filter graphs for the /bassboost command. Boosts
+# low frequencies (~60Hz and ~150Hz) at increasing gain per level — good
+# for heavy/loud tracks.
+BASS_PRESETS: dict[str, str] = {
+    "off": "",
+    "low": "equalizer=f=60:width_type=o:width=2:g=4,equalizer=f=150:width_type=o:width=2:g=2",
+    "medium": "equalizer=f=60:width_type=o:width=2:g=8,equalizer=f=150:width_type=o:width=2:g=4",
+    "high": "equalizer=f=60:width_type=o:width=2:g=12,equalizer=f=150:width_type=o:width=2:g=6",
+    "extreme": "equalizer=f=60:width_type=o:width=2:g=18,equalizer=f=150:width_type=o:width=2:g=9",
+}
+
+BASS_CHOICES = [
+    app_commands.Choice(name="Off", value="off"),
+    app_commands.Choice(name="Low", value="low"),
+    app_commands.Choice(name="Medium", value="medium"),
+    app_commands.Choice(name="High", value="high"),
+    app_commands.Choice(name="Extreme (very heavy bass)", value="extreme"),
+]
+
+ACTIVITY_TYPE_CHOICES = [
+    app_commands.Choice(name="Playing", value="playing"),
+    app_commands.Choice(name="Listening to", value="listening"),
+    app_commands.Choice(name="Watching", value="watching"),
+    app_commands.Choice(name="Competing in", value="competing"),
+]
+
+_ACTIVITY_TYPE_MAP = {
+    "playing": discord.ActivityType.playing,
+    "listening": discord.ActivityType.listening,
+    "watching": discord.ActivityType.watching,
+    "competing": discord.ActivityType.competing,
+}
 
 
 class Music(commands.Cog):
@@ -101,7 +136,8 @@ class Music(commands.Cog):
 
                 try:
                     stream_url = await YTDLSource.refresh_stream_url(next_track)
-                    source = YTDLSource.build_audio_source(stream_url, state.volume)
+                    audio_filter = BASS_PRESETS.get(state.bass_level, "")
+                    source = YTDLSource.build_audio_source(stream_url, state.volume, audio_filter)
                 except TrackUnavailableError as exc:
                     await self._notify(state, f"Skipping **{next_track.title}** — {exc}")
                     continue
@@ -156,6 +192,35 @@ class Music(commands.Cog):
             except discord.HTTPException:
                 log.warning("Failed to send notification message")
 
+    async def _update_presence(
+        self, text: str | None, activity_type: discord.ActivityType = discord.ActivityType.listening
+    ) -> None:
+        """Update the bot's global status/activity. Note: Discord bots only
+        have ONE presence shared across every server they're in — this
+        isn't a per-guild setting (that's a platform limitation, not
+        something the bot can work around)."""
+        activity = discord.Activity(type=activity_type, name=text or "/play")
+        try:
+            await self.bot.change_presence(activity=activity)
+        except discord.HTTPException:
+            log.warning("Failed to update bot presence")
+
+    async def _update_nickname(self, guild: discord.Guild | None, nick: str | None) -> None:
+        """Update the bot's nickname in a single guild. Passing nick=None
+        resets it back to the bot's default account name."""
+        if guild is None or guild.me is None:
+            return
+        try:
+            await guild.me.edit(nick=nick[:32] if nick else None)
+        except discord.Forbidden:
+            log.warning(
+                "Missing permission to change nickname in guild %s "
+                "(bot needs the 'Change Nickname' permission).",
+                guild.id,
+            )
+        except discord.HTTPException:
+            log.warning("Failed to update nickname in guild %s", guild.id)
+
     # ---------- commands ----------
 
     @app_commands.command(name="join", description="Join your current voice channel")
@@ -173,10 +238,13 @@ class Music(commands.Cog):
         if state.voice_client is None or not state.voice_client.is_connected():
             await interaction.response.send_message("I'm not in a voice channel.", ephemeral=True)
             return
+        # Mark this as an intentional disconnect so on_voice_state_update
+        # doesn't try to auto-reconnect (the bot normally stays in the
+        # room and only leaves when explicitly told to via /leave).
+        state.expected_disconnect = True
         state.clear()
         await state.voice_client.disconnect()
         state.voice_client = None
-        self.manager.remove(interaction.guild_id)
         await interaction.response.send_message("Disconnected and cleared the queue.")
 
     @app_commands.command(name="play", description="Play a song by search term or URL")
@@ -346,17 +414,163 @@ class Music(commands.Cog):
             state.voice_client.source.volume = state.volume
         await interaction.response.send_message(f"Volume set to {level}%.")
 
+    @app_commands.command(name="lyrics", description="Show lyrics for the current song or a search")
+    @app_commands.describe(query="Optional: 'Artist - Title' to look up. Defaults to the currently playing track.")
+    @app_commands.guild_only()
+    async def lyrics(self, interaction: discord.Interaction, query: str | None = None):
+        await interaction.response.defer()
+        state = self._state(interaction.guild_id)
+
+        if query:
+            artist, title = split_artist_title(query)
+        elif state.current:
+            artist, title = split_artist_title(state.current.title)
+        else:
+            await interaction.followup.send(
+                "Nothing is playing, and no search was given. Try `/lyrics Artist - Title`."
+            )
+            return
+
+        if not artist:
+            await interaction.followup.send(
+                f"Couldn't tell the artist from **{title}**. Try `/lyrics Artist - Title` explicitly."
+            )
+            return
+
+        try:
+            lyrics_text = await fetch_lyrics(artist, title)
+        except LyricsNotFoundError as exc:
+            await interaction.followup.send(str(exc))
+            return
+
+        header = f"**{title}** \u2014 {artist}\n\n"
+        full_text = header + lyrics_text
+        # Discord messages are capped at 2000 characters; split into pages.
+        pages = [full_text[i : i + 1900] for i in range(0, len(full_text), 1900)]
+        await interaction.followup.send(pages[0])
+        for page in pages[1:]:
+            await interaction.followup.send(page)
+
+    @app_commands.command(name="bassboost", description="Set the bass boost level (great for heavy/loud tracks)")
+    @app_commands.describe(level="Bass boost intensity")
+    @app_commands.choices(level=BASS_CHOICES)
+    @app_commands.guild_only()
+    async def bassboost(self, interaction: discord.Interaction, level: app_commands.Choice[str]):
+        state = self._state(interaction.guild_id)
+        state.bass_level = level.value
+
+        currently_playing = state.voice_client and (
+            state.voice_client.is_playing() or state.voice_client.is_paused()
+        )
+        if currently_playing and state.current:
+            # Restart the current track with the new filter applied. This
+            # restarts from the beginning — FFmpeg can't resume mid-stream
+            # once the filter graph changes.
+            state.queue.appendleft(state.current)
+            state.voice_client.stop()  # triggers `after` -> plays the requeued track
+            await interaction.response.send_message(
+                f"Bass boost set to **{level.name}**. Restarting the current track from the "
+                "top to apply it."
+            )
+        else:
+            await interaction.response.send_message(
+                f"Bass boost set to **{level.name}**. It'll apply to the next track played."
+            )
+
+    # ---------- manual bot appearance controls (owner/admin only) ----------
+
+    @app_commands.command(name="setnickname", description="[Admin] Change the bot's nickname in this server")
+    @app_commands.describe(name="New nickname, or leave empty to reset to the default")
+    @app_commands.guild_only()
+    @app_commands.checks.has_permissions(administrator=True)
+    async def setnickname(self, interaction: discord.Interaction, name: str | None = None):
+        await self._update_nickname(interaction.guild, name)
+        if name:
+            await interaction.response.send_message(f"Nickname set to **{name}**.", ephemeral=True)
+        else:
+            await interaction.response.send_message("Nickname reset to default.", ephemeral=True)
+
+    @app_commands.command(name="setstatus", description="[Admin] Change the bot's activity status")
+    @app_commands.describe(type="Activity type shown before the text", text="Status text, e.g. a custom message")
+    @app_commands.choices(type=ACTIVITY_TYPE_CHOICES)
+    @app_commands.guild_only()
+    @app_commands.checks.has_permissions(administrator=True)
+    async def setstatus(self, interaction: discord.Interaction, type: app_commands.Choice[str], text: str):
+        await self._update_presence(text, _ACTIVITY_TYPE_MAP[type.value])
+        await interaction.response.send_message(
+            f"Status set to **{type.name} {text}**. (Note: this is shared across every server the bot is in.)",
+            ephemeral=True,
+        )
+
+    @app_commands.command(name="setavatar", description="[Admin] Change the bot's profile picture")
+    @app_commands.describe(image_url="Direct URL to an image (png/jpg), e.g. from Discord's own CDN")
+    @app_commands.guild_only()
+    @app_commands.checks.has_permissions(administrator=True)
+    async def setavatar(self, interaction: discord.Interaction, image_url: str):
+        await interaction.response.defer(ephemeral=True)
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(image_url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                    if resp.status != 200:
+                        await interaction.followup.send(f"Couldn't download that image (HTTP {resp.status}).")
+                        return
+                    image_bytes = await resp.read()
+        except aiohttp.ClientError as exc:
+            await interaction.followup.send(f"Couldn't download that image: {exc}")
+            return
+
+        try:
+            await self.bot.user.edit(avatar=image_bytes)
+        except discord.HTTPException as exc:
+            # Discord allows avatar changes only ~2 times per hour — this is
+            # the most common failure reason here.
+            await interaction.followup.send(
+                f"Couldn't update the avatar: {exc}. Discord limits avatar changes to "
+                "about twice per hour, so this may just need a bit more time."
+            )
+            return
+
+        await interaction.followup.send("Profile picture updated.")
+
     @commands.Cog.listener()
     async def on_voice_state_update(self, member: discord.Member, before, after):
-        """Handle unexpected disconnects (e.g. connection drops, kicked from
-        channel) by cleaning up state instead of leaving it dangling."""
-        if member.id != self.bot.user.id:
+        """Keep the bot 'planted' in its voice room. If it gets disconnected
+        unexpectedly (network blip, accidental kick, server restart, etc.)
+        it rejoins the same channel and resumes the interrupted track,
+        instead of silently leaving. Intentional disconnects via /leave set
+        `expected_disconnect` beforehand so we don't fight those."""
+        if member.id != self.bot.user.id or member.guild is None:
             return
-        if before.channel is not None and after.channel is None:
-            state = self.manager.get(member.guild.id) if member.guild else None
-            if state:
-                state.clear()
-                state.voice_client = None
+        if before.channel is None or after.channel is not None:
+            return  # not a "left a channel" event
+
+        guild = member.guild
+        state = self.manager.get(guild.id)
+
+        if state.expected_disconnect:
+            state.expected_disconnect = False
+            return
+
+        log.warning("Unexpected voice disconnect in guild %s — attempting to rejoin.", guild.id)
+        channel = before.channel
+        state.voice_client = None
+        await asyncio.sleep(3)  # brief backoff before rejoining
+        try:
+            voice_client = await channel.connect()
+        except discord.ClientException:
+            log.warning("Auto-reconnect failed for guild %s", guild.id)
+            state.clear()
+            await self._update_presence(None)
+            await self._update_nickname(guild, None)
+            return
+
+        state.voice_client = voice_client
+        if state.current is not None:
+            # Re-queue the interrupted track so it plays again from the top
+            # (FFmpeg can't resume mid-stream after a full reconnect).
+            state.queue.appendleft(state.current)
+            state.current = None
+        await self._advance_queue(guild)
 
 
 async def setup(bot: commands.Bot):

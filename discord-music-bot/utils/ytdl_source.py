@@ -161,12 +161,21 @@ class YTDLSource:
         return TrackUnavailableError(f"Couldn't load that track: {exc}")
 
     @staticmethod
-    def build_audio_source(stream_url: str, volume: float) -> discord.PCMVolumeTransformer:
+    def build_audio_source(
+        stream_url: str, volume: float, audio_filter: str = ""
+    ) -> discord.PCMVolumeTransformer:
         """Build a discord.py audio source from a resolved stream URL,
-        piping through FFmpeg with auto-reconnect on connection drops."""
+        piping through FFmpeg with auto-reconnect on connection drops.
+
+        `audio_filter` is an optional FFmpeg `-af` filter graph string (used
+        for the bass boost feature); pass "" for no extra filtering.
+        """
+        options = FFMPEG_OPTIONS
+        if audio_filter:
+            options = f'{FFMPEG_OPTIONS} -af "{audio_filter}"'
         source = discord.FFmpegPCMAudio(
             stream_url,
             before_options=FFMPEG_BEFORE_OPTIONS,
-            options=FFMPEG_OPTIONS,
+            options=options,
         )
         return discord.PCMVolumeTransformer(source, volume=volume)

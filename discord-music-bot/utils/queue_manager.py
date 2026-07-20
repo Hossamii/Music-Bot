@@ -49,6 +49,10 @@ class GuildMusicState:
     text_channel: Optional[object] = None
     play_next_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     skip_requested: bool = False
+    bass_level: str = "off"  # "off" | "low" | "medium" | "high" | "extreme"
+    # Set right before an intentional disconnect (e.g. /leave) so the
+    # voice_state_update listener knows NOT to try to auto-reconnect.
+    expected_disconnect: bool = False
 
     def add(self, track: Track) -> int:
         """Add a track to the queue. Returns its 1-based position."""
