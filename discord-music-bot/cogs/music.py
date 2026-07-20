@@ -1,6 +1,6 @@
 """
 Text commands for the music bot: join/leave, play/pause/resume/skip/stop,
-queue display, volume control, lyrics, bass boost, and admin appearance
+queue display, volume control, bass boost, and admin appearance/presence
 controls. All music playback logic and error handling for a single guild
 lives in this cog.
 
@@ -18,7 +18,6 @@ import aiohttp
 import discord
 from discord.ext import commands
 
-from utils.lyrics import LyricsNotFoundError, fetch_lyrics, split_artist_title
 from utils.queue_manager import GuildMusicState, MusicManager, Track
 from utils.ytdl_source import TrackUnavailableError, YTDLSource
 
@@ -41,6 +40,18 @@ ACTIVITY_TYPES: dict[str, discord.ActivityType] = {
     "listening": discord.ActivityType.listening,
     "watching": discord.ActivityType.watching,
     "competing": discord.ActivityType.competing,
+}
+
+# discord.py's Status enum — this is the colored dot next to the bot's name
+# (separate from ACTIVITY_TYPES above, which is the "Listening to ..." text).
+# Discord has no real settable "offline" state for a logged-in bot; the
+# closest equivalent is `invisible`, which makes it appear offline to
+# members while staying connected.
+STATUS_PRESETS: dict[str, discord.Status] = {
+    "online": discord.Status.online,
+    "idle": discord.Status.idle,
+    "dnd": discord.Status.dnd,
+    "offline": discord.Status.invisible,
 }
 
 
@@ -171,12 +182,15 @@ class Music(commands.Cog):
     async def _update_presence(
         self, text: str | None, activity_type: discord.ActivityType = discord.ActivityType.listening
     ) -> None:
-        """Update the bot's global status/activity. Note: Discord bots only
-        have ONE presence shared across every server they're in — this
-        isn't a per-guild setting (that's a platform limitation)."""
+        """Update the bot's global activity text (e.g. "Listening to ...").
+        Note: Discord bots only have ONE presence shared across every server
+        they're in — this isn't a per-guild setting (that's a platform
+        limitation). Re-sends the current status (online/idle/dnd/offline)
+        alongside it, so this never silently resets a status set via
+        `setpresence` back to the online default."""
         activity = discord.Activity(type=activity_type, name=text or "play <song>")
         try:
-            await self.bot.change_presence(activity=activity)
+            await self.bot.change_presence(status=self.bot.status, activity=activity)
         except discord.HTTPException:
             log.warning("Failed to update bot presence")
 
@@ -356,36 +370,6 @@ class Music(commands.Cog):
             state.voice_client.source.volume = state.volume
         await ctx.send(f"Volume set to {level}%.")
 
-    @commands.command(name="lyrics")
-    @commands.guild_only()
-    async def lyrics(self, ctx: commands.Context, *, query: str = None):
-        state = self._state(ctx.guild.id)
-
-        if query:
-            artist, title = split_artist_title(query)
-        elif state.current:
-            artist, title = split_artist_title(state.current.title)
-        else:
-            await ctx.send("Nothing is playing, and no search was given. Try `lyrics Artist - Title`.")
-            return
-
-        if not artist:
-            await ctx.send(f"Couldn't tell the artist from **{title}**. Try `lyrics Artist - Title` explicitly.")
-            return
-
-        try:
-            lyrics_text = await fetch_lyrics(artist, title)
-        except LyricsNotFoundError as exc:
-            await ctx.send(str(exc))
-            return
-
-        header = f"**{title}** \u2014 {artist}\n\n"
-        full_text = header + lyrics_text
-        # Discord messages are capped at 2000 characters; split into pages.
-        pages = [full_text[i : i + 1900] for i in range(0, len(full_text), 1900)]
-        for page in pages:
-            await ctx.send(page)
-
     @commands.command(name="bassboost")
     @commands.guild_only()
     async def bassboost(self, ctx: commands.Context, level: str = None):
@@ -431,6 +415,26 @@ class Music(commands.Cog):
         activity_type = activity_type.lower()
         await self._update_presence(text, ACTIVITY_TYPES[activity_type])
         await ctx.send(f"Status set to **{activity_type} {text}**. (Shared across every server the bot is in.)")
+
+    @commands.command(name="setpresence")
+    @commands.guild_only()
+    @commands.has_permissions(administrator=True)
+    async def setpresence(self, ctx: commands.Context, state: str = None):
+        """Controls the colored presence dot (online/idle/dnd/offline) —
+        different from `setstatus`, which controls the "Listening to ..."
+        activity text next to it."""
+        if state is None or state.lower() not in STATUS_PRESETS:
+            await ctx.send(f"Usage: `setpresence <{'/'.join(STATUS_PRESETS)}>`")
+            return
+        state = state.lower()
+        try:
+            await self.bot.change_presence(status=STATUS_PRESETS[state], activity=self.bot.activity)
+        except discord.HTTPException:
+            log.warning("Failed to update bot presence status")
+            await ctx.send("Couldn't update the status right now. Try again in a bit.")
+            return
+        note = " (Discord has no true offline state for bots — this makes it appear offline.)" if state == "offline" else ""
+        await ctx.send(f"Bot presence set to **{state}**.{note} (Shared across every server the bot is in.)")
 
     @commands.command(name="setavatar")
     @commands.guild_only()
