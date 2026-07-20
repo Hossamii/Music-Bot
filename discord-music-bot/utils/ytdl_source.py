@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from typing import Optional
 
 import discord
@@ -20,6 +21,17 @@ import yt_dlp
 from .queue_manager import Track
 
 log = logging.getLogger("music.ytdl")
+
+# Path to a Netscape-format cookies.txt file exported from a logged-in
+# YouTube browser session. Needed because YouTube frequently throws
+# "Sign in to confirm you're not a bot" at datacenter/cloud IPs (Replit,
+# Railway, etc.) without it. Kept as a file on disk (not committed to git —
+# see .gitignore) so it survives independently of code updates/pulls.
+# Override the path with the COOKIES_FILE env var if you store it elsewhere.
+COOKIES_FILE = os.environ.get(
+    "COOKIES_FILE",
+    os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "cookies.txt"),
+)
 
 # Force IPv4 (avoids some geo/ISP IPv6 resolution issues) and UTF-8 everywhere.
 YTDL_FORMAT_OPTIONS = {
@@ -38,6 +50,16 @@ YTDL_FORMAT_OPTIONS = {
     # Keep original metadata (titles, artist names) untouched/untransliterated.
     "writesubtitles": False,
 }
+
+if os.path.isfile(COOKIES_FILE):
+    YTDL_FORMAT_OPTIONS["cookiefile"] = COOKIES_FILE
+    log.info("Using YouTube cookies from %s", COOKIES_FILE)
+else:
+    log.warning(
+        "No cookies.txt found at %s — YouTube may block playback with "
+        "'Sign in to confirm you're not a bot'. See README for how to add one.",
+        COOKIES_FILE,
+    )
 
 FFMPEG_BEFORE_OPTIONS = (
     "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5"

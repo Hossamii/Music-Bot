@@ -47,3 +47,7 @@ Thumbs.db
 # Replit
 .cache/
 .local/
+
+# YouTube cookies (yt-dlp auth) — never commit, keep local only
+cookies.txt
+discord-music-bot/cookies.txt
