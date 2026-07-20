@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import tempfile
 from typing import Optional
 
 import discord
@@ -22,16 +23,34 @@ from .queue_manager import Track
 
 log = logging.getLogger("music.ytdl")
 
-# Path to a Netscape-format cookies.txt file exported from a logged-in
-# YouTube browser session. Needed because YouTube frequently throws
-# "Sign in to confirm you're not a bot" at datacenter/cloud IPs (Replit,
-# Railway, etc.) without it. Kept as a file on disk (not committed to git —
-# see .gitignore) so it survives independently of code updates/pulls.
-# Override the path with the COOKIES_FILE env var if you store it elsewhere.
+# --- YouTube cookies setup -------------------------------------------------
+#
+# YouTube frequently throws "Sign in to confirm you're not a bot" at
+# datacenter/cloud IPs (Railway, Replit, etc.) without a logged-in session's
+# cookies attached to the request.
+#
+# Two ways to supply cookies, checked in this order:
+#   1. YTDLP_COOKIES env var — the *contents* of a Netscape-format
+#      cookies.txt file, pasted directly into a Railway/host environment
+#      variable. This is the preferred method: env vars are never touched
+#      by git pushes/pulls, so cookies can't get wiped by a code update.
+#      Written out to a temp file at startup since yt-dlp needs a file path.
+#   2. cookies.txt file on disk next to bot.py (COOKIES_FILE env var can
+#      override the path). Useful for local/manual setups, but note this
+#      file is git-ignored — it will NOT be present after a fresh deploy
+#      from GitHub unless you upload it directly to the host each time.
+_COOKIES_ENV = os.environ.get("YTDLP_COOKIES")
 COOKIES_FILE = os.environ.get(
     "COOKIES_FILE",
     os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "cookies.txt"),
 )
+
+if _COOKIES_ENV:
+    _tmp_cookies_path = os.path.join(tempfile.gettempdir(), "yt_dlp_cookies.txt")
+    with open(_tmp_cookies_path, "w", encoding="utf-8") as _f:
+        _f.write(_COOKIES_ENV)
+    COOKIES_FILE = _tmp_cookies_path
+    log.info("Wrote YouTube cookies from YTDLP_COOKIES env var to %s", COOKIES_FILE)
 
 # Force IPv4 (avoids some geo/ISP IPv6 resolution issues) and UTF-8 everywhere.
 YTDL_FORMAT_OPTIONS = {
@@ -56,8 +75,8 @@ if os.path.isfile(COOKIES_FILE):
     log.info("Using YouTube cookies from %s", COOKIES_FILE)
 else:
     log.warning(
-        "No cookies.txt found at %s — YouTube may block playback with "
-        "'Sign in to confirm you're not a bot'. See README for how to add one.",
+        "No YouTube cookies found (checked YTDLP_COOKIES env var and %s) — "
+        "YouTube may block playback with 'Sign in to confirm you're not a bot'.",
         COOKIES_FILE,
     )
 
