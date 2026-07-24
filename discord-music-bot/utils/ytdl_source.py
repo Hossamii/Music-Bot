@@ -116,7 +116,24 @@ class YTDLSource:
     """Static helpers for resolving search queries / URLs into Track objects
     and building playable discord.py audio sources."""
 
-    _ytdl = yt_dlp.YoutubeDL(YTDL_FORMAT_OPTIONS)
+    _ytdl: yt_dlp.YoutubeDL = yt_dlp.YoutubeDL(YTDL_FORMAT_OPTIONS)
+    _ytdl_created_at: float = 0.0
+    _YTDL_TTL: float = 3600.0  # rebuild the session every 1 hour
+
+    @classmethod
+    def _get_ytdl(cls) -> yt_dlp.YoutubeDL:
+        """Return a fresh YoutubeDL instance, rebuilding it if the TTL has
+        elapsed. YouTube blocks long-lived sessions from cloud IPs; cycling
+        the instance resets the session and avoids 'Sign in' / age-restriction
+        errors that appear hours after the bot starts even when cookies are
+        valid."""
+        import time
+        now = time.monotonic()
+        if now - cls._ytdl_created_at >= cls._YTDL_TTL:
+            cls._ytdl = yt_dlp.YoutubeDL(YTDL_FORMAT_OPTIONS)
+            cls._ytdl_created_at = now
+            log.info("Rebuilt yt-dlp YoutubeDL instance (TTL elapsed).")
+        return cls._ytdl
 
     @classmethod
     async def resolve(
@@ -141,8 +158,9 @@ class YTDLSource:
             search_query = f"ytsearch1:{query}"
 
         try:
+            ytdl = cls._get_ytdl()
             data = await loop.run_in_executor(
-                None, lambda: cls._ytdl.extract_info(search_query, download=False)
+                None, lambda: ytdl.extract_info(search_query, download=False)
             )
         except yt_dlp.utils.DownloadError as exc:
             raise cls._translate_error(exc) from exc
@@ -193,8 +211,9 @@ class YTDLSource:
         playback to avoid 403s on tracks that sat in the queue a while."""
         loop = loop or asyncio.get_event_loop()
         try:
+            ytdl = cls._get_ytdl()
             data = await loop.run_in_executor(
-                None, lambda: cls._ytdl.extract_info(track.webpage_url, download=False)
+                None, lambda: ytdl.extract_info(track.webpage_url, download=False)
             )
         except yt_dlp.utils.DownloadError as exc:
             raise cls._translate_error(exc) from exc
