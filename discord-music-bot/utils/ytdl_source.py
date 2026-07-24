@@ -45,6 +45,18 @@ COOKIES_FILE = os.environ.get(
     os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "cookies.txt"),
 )
 
+# Optional override for which YouTube "player client" yt-dlp impersonates.
+# Cloud/datacenter IPs (Railway, Render, etc.) are increasingly asked for a
+# PO Token by YouTube's default clients even when cookies are valid; some
+# alternate clients avoid that requirement (at the cost of not being able to
+# resolve some age-restricted/members-only content). This is a fast-moving
+# target as YouTube adjusts bot-detection, so it's an env var you can change
+# from Railway's dashboard and restart — no redeploy needed — instead of a
+# hardcoded value. Comma-separated, e.g. "tv,web_embedded,android". Leave
+# unset to use yt-dlp's own default client selection.
+# See: https://github.com/yt-dlp/yt-dlp/wiki/PO-Token-Guide
+_PLAYER_CLIENT = os.environ.get("YTDLP_PLAYER_CLIENT")
+
 
 def _normalize_netscape_cookies(raw: str) -> str:
     """Repair common damage that happens when a cookies.txt file is pasted
