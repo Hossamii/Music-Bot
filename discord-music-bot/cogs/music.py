@@ -204,10 +204,23 @@ class Music(commands.Cog):
         they're in — this isn't a per-guild setting (that's a platform
         limitation). Re-sends the current status (online/idle/dnd/offline)
         alongside it, so this never silently resets a status set via
-        `setpresence` back to the online default."""
+        `setpresence` back to the online default.
+
+        IMPORTANT: the "current status" is read from presence_store, NOT
+        from `self.bot.status`. discord.py has a known bug/quirk
+        (Rapptz/discord.py#9440, closed "as designed") where `bot.status`
+        is never updated locally by `change_presence()` — it stays stuck
+        at its last-known value (usually `online`) even after a status
+        change succeeds on Discord's side. Relying on it here would silently
+        reset `setpresence idle` back to online the next time `setstatus`
+        (or anything else calling this) ran. presence_store is the actual
+        source of truth since it's updated in lockstep with every
+        successful `change_presence()` call."""
+        saved_status = presence_store.load()["status"]
+        current_status = STATUS_PRESETS.get(saved_status, discord.Status.online)
         activity = discord.Activity(type=activity_type, name=text or "play <song>")
         try:
-            await self.bot.change_presence(status=self.bot.status, activity=activity)
+            await self.bot.change_presence(status=current_status, activity=activity)
         except discord.HTTPException:
             log.warning("Failed to update bot presence")
             return
@@ -457,8 +470,13 @@ class Music(commands.Cog):
             await ctx.send(f"Usage: `setpresence <{'/'.join(STATUS_PRESETS)}>`")
             return
         state = state.lower()
+        saved = presence_store.load()
+        current_activity = discord.Activity(
+            type=ACTIVITY_TYPES.get(saved["activity_type"], discord.ActivityType.listening),
+            name=saved["activity_text"],
+        )
         try:
-            await self.bot.change_presence(status=STATUS_PRESETS[state], activity=self.bot.activity)
+            await self.bot.change_presence(status=STATUS_PRESETS[state], activity=current_activity)
         except discord.HTTPException:
             log.warning("Failed to update bot presence status")
             await ctx.send("Couldn't update the status right now. Try again in a bit.")
