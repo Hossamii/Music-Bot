@@ -26,13 +26,18 @@ log = logging.getLogger("music.cog")
 
 # FFmpeg `-af` equalizer filter graphs for the bassboost command. Boosts low
 # frequencies (~60Hz and ~150Hz) at increasing gain per level — good for
-# heavy/loud tracks.
+# heavy/loud tracks. An `alimiter` is chained on at the end of every level
+# above "off": once the gain gets this high, without it the signal clips
+# (crackles/distorts) on bass-heavy sections instead of just sounding
+# louder. `limit=0.9` caps output peaks at 90% of full scale, which leaves
+# just enough headroom to absorb the boost without audibly squashing the
+# rest of the mix.
 BASS_PRESETS: dict[str, str] = {
     "off": "",
-    "low": "equalizer=f=60:width_type=o:width=2:g=4,equalizer=f=150:width_type=o:width=2:g=2",
-    "medium": "equalizer=f=60:width_type=o:width=2:g=8,equalizer=f=150:width_type=o:width=2:g=4",
-    "high": "equalizer=f=60:width_type=o:width=2:g=12,equalizer=f=150:width_type=o:width=2:g=6",
-    "extreme": "equalizer=f=60:width_type=o:width=2:g=18,equalizer=f=150:width_type=o:width=2:g=9",
+    "low": "equalizer=f=60:width_type=o:width=2:g=8,equalizer=f=150:width_type=o:width=2:g=4,alimiter=limit=0.9",
+    "medium": "equalizer=f=60:width_type=o:width=2:g=15,equalizer=f=150:width_type=o:width=2:g=8,alimiter=limit=0.9",
+    "high": "equalizer=f=60:width_type=o:width=2:g=22,equalizer=f=150:width_type=o:width=2:g=12,alimiter=limit=0.9",
+    "extreme": "equalizer=f=60:width_type=o:width=2:g=30,equalizer=f=150:width_type=o:width=2:g=16,alimiter=limit=0.85",
 }
 BASS_LEVELS = tuple(BASS_PRESETS.keys())
 
@@ -128,10 +133,17 @@ class Music(commands.Cog):
                 if state.voice_client.is_playing() or state.voice_client.is_paused():
                     return
 
+                # Consumed here (and reset) so it only applies to the track
+                # it was set for — e.g. a bassboost-triggered restart of the
+                # current track — and not to a genuinely different track
+                # that gets picked up after a TrackUnavailableError below.
+                seek = state.pending_seek
+                state.pending_seek = 0.0
+
                 try:
                     stream_url = await YTDLSource.refresh_stream_url(next_track)
                     audio_filter = BASS_PRESETS.get(state.bass_level, "")
-                    source = YTDLSource.build_audio_source(stream_url, state.volume, audio_filter)
+                    source = YTDLSource.build_audio_source(stream_url, state.volume, audio_filter, start_at=seek)
                 except TrackUnavailableError as exc:
                     await self._notify(state, f"Skipping **{next_track.title}** — {exc}")
                     continue
@@ -151,6 +163,7 @@ class Music(commands.Cog):
 
                 try:
                     state.voice_client.play(source, after=_after)
+                    state.start_playback(offset=seek)
                 except discord.opus.OpusNotLoaded:
                     log.exception(
                         "libopus is not loaded — voice playback cannot start. "
@@ -298,6 +311,7 @@ class Music(commands.Cog):
             await ctx.send("Nothing is playing.")
             return
         state.voice_client.pause()
+        state.mark_paused()
         await ctx.send("Paused.")
 
     @commands.command(name="resume")
@@ -308,6 +322,7 @@ class Music(commands.Cog):
             await ctx.send("Nothing is paused.")
             return
         state.voice_client.resume()
+        state.mark_resumed()
         await ctx.send("Resumed.")
 
     @commands.command(name="skip")
@@ -393,12 +408,18 @@ class Music(commands.Cog):
             state.voice_client.is_playing() or state.voice_client.is_paused()
         )
         if currently_playing and state.current:
-            # Restart the current track with the new filter applied. This
-            # restarts from the beginning — FFmpeg can't resume mid-stream
-            # once the filter graph changes.
+            # FFmpeg can't change its filter graph mid-stream, so a restart
+            # is unavoidable — but we can seek the new source back to
+            # roughly where the old one was, instead of starting over from
+            # 0:00. Clamp to the track's known duration (if any) so a
+            # slightly-stale estimate can never seek past the end.
+            seek_to = state.elapsed_seconds()
+            if state.current.duration:
+                seek_to = min(seek_to, max(state.current.duration - 1, 0))
+            state.pending_seek = seek_to
             state.queue.appendleft(state.current)
-            state.voice_client.stop()  # triggers `after` -> plays the requeued track
-            await ctx.send(f"Bass boost set to **{level}**. Restarting the current track from the top to apply it.")
+            state.voice_client.stop()  # triggers `after` -> replays the requeued track, seeked to `pending_seek`
+            await ctx.send(f"Bass boost set to **{level}**. Picking back up from where it was.")
         else:
             await ctx.send(f"Bass boost set to **{level}**. It'll apply to the next track played.")
 
