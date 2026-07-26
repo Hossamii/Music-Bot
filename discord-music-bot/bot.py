@@ -27,6 +27,8 @@ sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="repla
 sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
 
 from keep_alive import keep_alive  # noqa: E402  (import after stdout patch)
+from cogs.music import ACTIVITY_TYPES, STATUS_PRESETS  # noqa: E402
+from utils.presence_store import load as load_presence  # noqa: E402
 
 logging.basicConfig(
     level=logging.INFO,
@@ -98,8 +100,21 @@ async def on_ready():
         log.info("Synced %d slash command(s) (expected 0 — this bot uses text commands).", len(synced))
     except discord.HTTPException:
         log.exception("Failed to sync slash commands")
-    activity = discord.Activity(type=discord.ActivityType.listening, name="play <song>")
-    await bot.change_presence(activity=activity)
+
+    # Re-apply whatever status/activity was last set via setstatus /
+    # setpresence, instead of a hardcoded default. on_ready can fire more
+    # than once per process (Discord sometimes forces a fresh READY instead
+    # of resuming an existing session), so without this a custom presence
+    # would randomly get reset to "online" / "Listening to play <song>"
+    # mid-session — and a real restart lost it for good since it was never
+    # saved anywhere. See utils/presence_store.py.
+    saved = load_presence()
+    activity = discord.Activity(
+        type=ACTIVITY_TYPES.get(saved["activity_type"], discord.ActivityType.listening),
+        name=saved["activity_text"],
+    )
+    status = STATUS_PRESETS.get(saved["status"], discord.Status.online)
+    await bot.change_presence(status=status, activity=activity)
 
 
 @bot.event
