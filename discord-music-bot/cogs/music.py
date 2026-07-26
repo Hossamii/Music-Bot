@@ -18,6 +18,7 @@ import aiohttp
 import discord
 from discord.ext import commands
 
+from utils import presence_store
 from utils.queue_manager import GuildMusicState, MusicManager, Track
 from utils.ytdl_source import TrackUnavailableError, YTDLSource
 
@@ -41,6 +42,9 @@ ACTIVITY_TYPES: dict[str, discord.ActivityType] = {
     "watching": discord.ActivityType.watching,
     "competing": discord.ActivityType.competing,
 }
+# Reverse of the above — needed to turn a discord.ActivityType back into the
+# plain string that presence_store.save() persists to disk.
+ACTIVITY_TYPE_NAMES: dict[discord.ActivityType, str] = {v: k for k, v in ACTIVITY_TYPES.items()}
 
 # discord.py's Status enum — this is the colored dot next to the bot's name
 # (separate from ACTIVITY_TYPES above, which is the "Listening to ..." text).
@@ -193,6 +197,11 @@ class Music(commands.Cog):
             await self.bot.change_presence(status=self.bot.status, activity=activity)
         except discord.HTTPException:
             log.warning("Failed to update bot presence")
+            return
+        presence_store.save(
+            activity_type=ACTIVITY_TYPE_NAMES.get(activity_type, "listening"),
+            activity_text=text or "play <song>",
+        )
 
     async def _update_nickname(self, guild: discord.Guild | None, nick: str | None) -> None:
         """Update the bot's nickname in a single guild. Passing nick=None
@@ -433,6 +442,7 @@ class Music(commands.Cog):
             log.warning("Failed to update bot presence status")
             await ctx.send("Couldn't update the status right now. Try again in a bit.")
             return
+        presence_store.save(status=state)
         note = " (Discord has no true offline state for bots — this makes it appear offline.)" if state == "offline" else ""
         await ctx.send(f"Bot presence set to **{state}**.{note} (Shared across every server the bot is in.)")
 
