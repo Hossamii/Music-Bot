@@ -240,7 +240,28 @@ class YTDLSource:
     @staticmethod
     def _translate_error(exc: yt_dlp.utils.DownloadError) -> TrackUnavailableError:
         message = str(exc).lower()
-        if "sign in" in message or "age" in message:
+        # IMPORTANT: check the bot-detection message BEFORE the generic
+        # "sign in" check below. YouTube uses "sign in" in two very
+        # different messages that must NOT be collapsed into one:
+        #   - "Sign in to confirm you're not a bot" -> NOT age-restriction.
+        #     This is YouTube's anti-scraping check on datacenter/cloud IPs
+        #     (Railway, Replit, etc.) and fires when the cookies YTDLSource
+        #     is using are missing, expired, or invalid — cookies expire on
+        #     their own over time even if the YTDLP_COOKIES env var on the
+        #     host was never touched. Needs a *fresh* cookie export, not a
+        #     code fix.
+        #   - "Sign in to confirm your age" -> genuine age-restriction.
+        # The old version matched both under one "age-restricted" message,
+        # which made an expired-cookies problem look identical to (and get
+        # mistaken for) a real age-restricted video.
+        if "not a bot" in message or "confirm you" in message and "bot" in message:
+            return TrackUnavailableError(
+                "YouTube is blocking this server's requests until it can verify it's not a bot — this "
+                "usually means the bot's YouTube cookies have expired and need to be re-exported/refreshed "
+                "(this is separate from age-restriction; the cookie value doesn't need to have changed on "
+                "your end for it to expire)."
+            )
+        if "confirm your age" in message or "age" in message:
             return TrackUnavailableError(
                 "That video is age-restricted and can't be played by the bot."
             )
