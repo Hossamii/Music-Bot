@@ -67,6 +67,14 @@ COOKIES_FILE = os.environ.get(
 # unset to use yt-dlp's own default client selection.
 # See: https://github.com/yt-dlp/yt-dlp/wiki/PO-Token-Guide
 _PLAYER_CLIENT = os.environ.get("YTDLP_PLAYER_CLIENT")
+# Optional PO Token for YouTube bot-detection bypass on cloud IPs.
+# See: https://github.com/yt-dlp/yt-dlp/wiki/PO-Token-Guide
+_PO_TOKEN = os.environ.get("YTDLP_PO_TOKEN")
+# Optional visitor data (used together with PO Token).
+_VISITOR_DATA = os.environ.get("YTDLP_VISITOR_DATA")
+# Sleep between requests to avoid 429 Too Many Requests from YouTube.
+# Set to e.g. "2" to sleep 2 seconds between extractions on cloud IPs.
+_SLEEP_INTERVAL = float(os.environ.get("YTDLP_SLEEP_INTERVAL", "0"))
 
 
 def _normalize_netscape_cookies(raw: str) -> str:
@@ -114,10 +122,6 @@ elif _COOKIES_ENV:
 
 # Force IPv4 (avoids some geo/ISP IPv6 resolution issues) and UTF-8 everywhere.
 YTDL_FORMAT_OPTIONS = {
-    # Broad format selector: prefer audio-only streams, fall back to anything
-    # with audio. The extra fallbacks ("bestaudio*" and "*") prevent the
-    # "Requested format is not available" error that fires when YouTube rotates
-    # its format IDs and yt-dlp's cached selection no longer exists.
     "format": "bestaudio/bestaudio*/best",
     "noplaylist": True,
     "nocheckcertificate": True,
@@ -130,9 +134,25 @@ YTDL_FORMAT_OPTIONS = {
     "encoding": "utf-8",
     "extract_flat": False,
     "geo_bypass": True,
-    # Keep original metadata (titles, artist names) untouched/untransliterated.
     "writesubtitles": False,
+    # Rate-limit mitigation: sleep between requests to avoid 429 on cloud IPs.
+    "sleep_interval": _SLEEP_INTERVAL,
+    "max_sleep_interval": _SLEEP_INTERVAL * 2 if _SLEEP_INTERVAL else 0,
 }
+
+# Apply player client override if set.
+if _PLAYER_CLIENT:
+    YTDL_FORMAT_OPTIONS["extractor_args"] = {
+        "youtube": {"player_client": _PLAYER_CLIENT.split(",")}
+    }
+
+# Apply PO Token + visitor data if set (for YouTube bot-detection bypass).
+if _PO_TOKEN:
+    _yt_args = YTDL_FORMAT_OPTIONS.setdefault("extractor_args", {}).setdefault("youtube", {})
+    _yt_args["po_token"] = [f"web+{_PO_TOKEN}"]
+    if _VISITOR_DATA:
+        _yt_args["visitor_data"] = [_VISITOR_DATA]
+    log.info("PO Token configured for YouTube bot-detection bypass.")
 
 if os.path.isfile(COOKIES_FILE):
     YTDL_FORMAT_OPTIONS["cookiefile"] = COOKIES_FILE
@@ -328,50 +348,11 @@ class YTDLSource:
     def build_audio_source(
         stream_url: str, volume: float, audio_filter: str = "", start_at: float = 0.0
     ) -> discord.PCMVolumeTransformer:
-        """Build a discord.py audio source from a resolved stream URL,
-        piping through FFmpeg with auto-reconnect on connection drops.
+        """Build a discord.py audio source from a resolved stream URL.
 
-        `audio_filter` is an optional FFmpeg `-af` filter graph string (used
-        for the bass boost feature); pass "" for no extra filtering.
-
-        `start_at` seeks the stream to that many seconds in before playback
-        starts (used to resume a track from where it was after a filter
-        change, instead of restarting from 0:00). `-ss` is placed in
-        `before_options` (i.e. before `-i`) so FFmpeg seeks the input
-        directly instead of decoding and discarding everything up to that
-        point — fast even for a seek several minutes in.
+        `audio_filter` is an optional FFmpeg `-af` filter graph string.
+        `start_at` seeks the stream before playback starts.
         """
-        import sys
-        import subprocess
-
-        # Re-resolve the stream URL right at play time via yt-dlp --get-url.
-        # YouTube stream URLs expire within seconds on cloud IPs (Railway, etc.),
-        # so by the time FFmpeg opens the connection the URL is already 403.
-        # Running yt-dlp synchronously here (inside build_audio_source, which is
-        # called from async context but is itself sync) gives us a URL that is
-        # guaranteed fresh — no race condition.
-        ytdlp_args = [
-            sys.executable, "-m", "yt_dlp",
-            "--quiet", "--no-warnings", "--no-playlist",
-            "--format", "bestaudio/bestaudio*/best",
-            "--get-url",
-            stream_url,
-        ]
-        if os.path.isfile(COOKIES_FILE):
-            ytdlp_args += ["--cookies", COOKIES_FILE]
-        if _PLAYER_CLIENT:
-            ytdlp_args += ["--extractor-args", f"youtube:player_client={_PLAYER_CLIENT}"]
-
-        try:
-            result = subprocess.run(
-                ytdlp_args, capture_output=True, text=True, timeout=30,
-            )
-            fresh_url = result.stdout.strip().splitlines()[0] if result.stdout.strip() else None
-        except Exception:
-            fresh_url = None
-
-        playback_url = fresh_url if fresh_url else stream_url
-
         before_options = FFMPEG_BEFORE_OPTIONS
         if start_at and start_at > 0:
             before_options = f"-ss {start_at:.2f} {FFMPEG_BEFORE_OPTIONS}"
@@ -379,7 +360,7 @@ class YTDLSource:
         if audio_filter:
             options = f'{FFMPEG_OPTIONS} -af "{audio_filter}"'
         source = discord.FFmpegPCMAudio(
-            playback_url,
+            stream_url,
             before_options=before_options,
             options=options,
         )
