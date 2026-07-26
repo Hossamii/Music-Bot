@@ -29,16 +29,27 @@ log = logging.getLogger("music.ytdl")
 # datacenter/cloud IPs (Railway, Replit, etc.) without a logged-in session's
 # cookies attached to the request.
 #
-# Two ways to supply cookies, checked in this order:
-#   1. YTDLP_COOKIES env var — the *contents* of a Netscape-format
-#      cookies.txt file, pasted directly into a Railway/host environment
-#      variable. This is the preferred method: env vars are never touched
-#      by git pushes/pulls, so cookies can't get wiped by a code update.
-#      Written out to a temp file at startup since yt-dlp needs a file path.
-#   2. cookies.txt file on disk next to bot.py (COOKIES_FILE env var can
+# Three ways to supply cookies, checked in this order:
+#   1. YTDLP_COOKIES_B64 env var (recommended) — the *entire contents* of a
+#      Netscape-format cookies.txt file, base64-encoded. This is the most
+#      reliable option for pasting into a host's env var UI: base64 output
+#      is plain ASCII with no tabs/newlines, so it can't get silently
+#      mangled the way a raw multi-line paste can (some web UIs — Railway's
+#      variable editor included — convert literal tab characters to spaces
+#      when a long value is pasted into a text field, which corrupts the
+#      Netscape format since fields are tab-separated; yt-dlp then silently
+#      drops any cookie line that gets mangled this way, which is enough to
+#      break authentication entirely even though most of the file still
+#      "looks" fine).
+#   2. YTDLP_COOKIES env var — the raw *contents* of a cookies.txt file
+#      pasted directly. Kept for backwards compatibility; prefer
+#      YTDLP_COOKIES_B64 above if you're hitting mysterious auth failures
+#      with this one, since a corrupted paste is very hard to spot by eye.
+#   3. cookies.txt file on disk next to bot.py (COOKIES_FILE env var can
 #      override the path). Useful for local/manual setups, but note this
 #      file is git-ignored — it will NOT be present after a fresh deploy
 #      from GitHub unless you upload it directly to the host each time.
+_COOKIES_B64_ENV = os.environ.get("YTDLP_COOKIES_B64")
 _COOKIES_ENV = os.environ.get("YTDLP_COOKIES")
 COOKIES_FILE = os.environ.get(
     "COOKIES_FILE",
@@ -79,7 +90,22 @@ def _normalize_netscape_cookies(raw: str) -> str:
     return text + "\n"
 
 
-if _COOKIES_ENV:
+if _COOKIES_B64_ENV:
+    import base64
+    _tmp_cookies_path = os.path.join(tempfile.gettempdir(), "yt_dlp_cookies.txt")
+    try:
+        _decoded = base64.b64decode(_COOKIES_B64_ENV.strip()).decode("utf-8")
+        with open(_tmp_cookies_path, "w", encoding="utf-8") as _f:
+            _f.write(_decoded if _decoded.endswith("\n") else _decoded + "\n")
+        COOKIES_FILE = _tmp_cookies_path
+        log.info("Wrote YouTube cookies from YTDLP_COOKIES_B64 env var to %s", COOKIES_FILE)
+    except Exception:
+        log.exception(
+            "Failed to decode YTDLP_COOKIES_B64 — make sure it's the base64 encoding of the "
+            "*whole* cookies.txt file (e.g. `base64 -w0 cookies.txt` on Linux/Mac, or "
+            "`[Convert]::ToBase64String([IO.File]::ReadAllBytes('cookies.txt'))` in PowerShell)."
+        )
+elif _COOKIES_ENV:
     _tmp_cookies_path = os.path.join(tempfile.gettempdir(), "yt_dlp_cookies.txt")
     with open(_tmp_cookies_path, "w", encoding="utf-8") as _f:
         _f.write(_normalize_netscape_cookies(_COOKIES_ENV))
