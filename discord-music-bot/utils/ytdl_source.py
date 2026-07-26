@@ -256,20 +256,30 @@ class YTDLSource:
 
     @staticmethod
     def build_audio_source(
-        stream_url: str, volume: float, audio_filter: str = ""
+        stream_url: str, volume: float, audio_filter: str = "", start_at: float = 0.0
     ) -> discord.PCMVolumeTransformer:
         """Build a discord.py audio source from a resolved stream URL,
         piping through FFmpeg with auto-reconnect on connection drops.
 
         `audio_filter` is an optional FFmpeg `-af` filter graph string (used
         for the bass boost feature); pass "" for no extra filtering.
+
+        `start_at` seeks the stream to that many seconds in before playback
+        starts (used to resume a track from where it was after a filter
+        change, instead of restarting from 0:00). `-ss` is placed in
+        `before_options` (i.e. before `-i`) so FFmpeg seeks the input
+        directly instead of decoding and discarding everything up to that
+        point — fast even for a seek several minutes in.
         """
+        before_options = FFMPEG_BEFORE_OPTIONS
+        if start_at and start_at > 0:
+            before_options = f"-ss {start_at:.2f} {before_options}"
         options = FFMPEG_OPTIONS
         if audio_filter:
             options = f'{FFMPEG_OPTIONS} -af "{audio_filter}"'
         source = discord.FFmpegPCMAudio(
             stream_url,
-            before_options=FFMPEG_BEFORE_OPTIONS,
+            before_options=before_options,
             options=options,
         )
         return discord.PCMVolumeTransformer(source, volume=volume)
