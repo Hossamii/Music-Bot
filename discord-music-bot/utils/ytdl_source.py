@@ -341,14 +341,45 @@ class YTDLSource:
         directly instead of decoding and discarding everything up to that
         point — fast even for a seek several minutes in.
         """
+        import sys
+        import subprocess
+
+        # Re-resolve the stream URL right at play time via yt-dlp --get-url.
+        # YouTube stream URLs expire within seconds on cloud IPs (Railway, etc.),
+        # so by the time FFmpeg opens the connection the URL is already 403.
+        # Running yt-dlp synchronously here (inside build_audio_source, which is
+        # called from async context but is itself sync) gives us a URL that is
+        # guaranteed fresh — no race condition.
+        ytdlp_args = [
+            sys.executable, "-m", "yt_dlp",
+            "--quiet", "--no-warnings", "--no-playlist",
+            "--format", "bestaudio/bestaudio*/best",
+            "--get-url",
+            stream_url,
+        ]
+        if os.path.isfile(COOKIES_FILE):
+            ytdlp_args += ["--cookies", COOKIES_FILE]
+        if _PLAYER_CLIENT:
+            ytdlp_args += ["--extractor-args", f"youtube:player_client={_PLAYER_CLIENT}"]
+
+        try:
+            result = subprocess.run(
+                ytdlp_args, capture_output=True, text=True, timeout=30,
+            )
+            fresh_url = result.stdout.strip().splitlines()[0] if result.stdout.strip() else None
+        except Exception:
+            fresh_url = None
+
+        playback_url = fresh_url if fresh_url else stream_url
+
         before_options = FFMPEG_BEFORE_OPTIONS
         if start_at and start_at > 0:
-            before_options = f"-ss {start_at:.2f} {before_options}"
+            before_options = f"-ss {start_at:.2f} {FFMPEG_BEFORE_OPTIONS}"
         options = FFMPEG_OPTIONS
         if audio_filter:
             options = f'{FFMPEG_OPTIONS} -af "{audio_filter}"'
         source = discord.FFmpegPCMAudio(
-            stream_url,
+            playback_url,
             before_options=before_options,
             options=options,
         )
