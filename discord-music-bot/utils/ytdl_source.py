@@ -114,7 +114,11 @@ elif _COOKIES_ENV:
 
 # Force IPv4 (avoids some geo/ISP IPv6 resolution issues) and UTF-8 everywhere.
 YTDL_FORMAT_OPTIONS = {
-    "format": "bestaudio/best",
+    # Broad format selector: prefer audio-only streams, fall back to anything
+    # with audio. The extra fallbacks ("bestaudio*" and "*") prevent the
+    # "Requested format is not available" error that fires when YouTube rotates
+    # its format IDs and yt-dlp's cached selection no longer exists.
+    "format": "bestaudio/bestaudio*/best",
     "noplaylist": True,
     "nocheckcertificate": True,
     "ignoreerrors": False,
@@ -246,22 +250,36 @@ class YTDLSource:
     @classmethod
     async def refresh_stream_url(cls, track: Track, loop: Optional[asyncio.AbstractEventLoop] = None) -> str:
         """Stream URLs from yt-dlp expire quickly; re-resolve right before
-        playback to avoid 403s on tracks that sat in the queue a while."""
+        playback to avoid 403s on tracks that sat in the queue a while.
+        If the first attempt returns no URL (e.g. stale format IDs), the
+        yt-dlp instance is forcibly rebuilt and one retry is attempted."""
         loop = loop or asyncio.get_event_loop()
-        try:
-            ytdl = cls._get_ytdl()
-            data = await loop.run_in_executor(
-                None, lambda: ytdl.extract_info(track.webpage_url, download=False)
-            )
-        except yt_dlp.utils.DownloadError as exc:
-            raise cls._translate_error(exc) from exc
 
-        stream_url = data.get("url") if data else None
-        if not stream_url:
-            raise TrackUnavailableError(
-                f'"{track.title}" is no longer available for playback.'
-            )
-        return stream_url
+        for attempt in range(2):
+            if attempt == 1:
+                # Force a fresh yt-dlp instance on the retry — stale format
+                # IDs are the most common reason the first attempt returns nothing.
+                cls._ytdl = yt_dlp.YoutubeDL(YTDL_FORMAT_OPTIONS)
+                cls._ytdl_created_at = 0.0
+                log.info("Rebuilt yt-dlp instance for retry on %r", track.title)
+
+            try:
+                ytdl = cls._get_ytdl()
+                data = await loop.run_in_executor(
+                    None, lambda: ytdl.extract_info(track.webpage_url, download=False)
+                )
+            except yt_dlp.utils.DownloadError as exc:
+                raise cls._translate_error(exc) from exc
+
+            stream_url = data.get("url") if data else None
+            if stream_url:
+                return stream_url
+
+            log.warning("No stream URL on attempt %d for %r — retrying with fresh instance.", attempt + 1, track.title)
+
+        raise TrackUnavailableError(
+            f'"{track.title}" is no longer available for playback.'
+        )
 
     @staticmethod
     def _translate_error(exc: yt_dlp.utils.DownloadError) -> TrackUnavailableError:
@@ -290,6 +308,11 @@ class YTDLSource:
         if "confirm your age" in message or "age" in message:
             return TrackUnavailableError(
                 "That video is age-restricted and can't be played by the bot."
+            )
+        if "requested format is not available" in message:
+            return TrackUnavailableError(
+                "YouTube changed its available formats — the bot's yt-dlp may be outdated. "
+                "Try again in a moment or search for a different version of the track."
             )
         if "not available" in message or "geo" in message or "blocked in your country" in message:
             return TrackUnavailableError(
