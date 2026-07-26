@@ -141,9 +141,11 @@ class Music(commands.Cog):
                 state.pending_seek = 0.0
 
                 try:
-                    stream_url = await YTDLSource.refresh_stream_url(next_track)
                     audio_filter = BASS_PRESETS.get(state.bass_level, "")
-                    source = YTDLSource.build_audio_source(stream_url, state.volume, audio_filter, start_at=seek)
+                    # Pass the webpage_url so build_audio_source re-resolves a
+                    # fresh stream URL via yt-dlp at the exact moment FFmpeg
+                    # needs it — avoids the 403 from an expired pre-resolved URL.
+                    source = YTDLSource.build_audio_source(next_track.webpage_url, state.volume, audio_filter, start_at=seek)
                 except TrackUnavailableError as exc:
                     await self._notify(state, f"Skipping **{next_track.title}** — {exc}")
                     continue
