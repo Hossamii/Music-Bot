@@ -99,6 +99,7 @@ def _normalize_netscape_cookies(raw: str) -> str:
 
 
 if _COOKIES_B64_ENV:
+    print(f"[cookies] YTDLP_COOKIES_B64 found, length={len(_COOKIES_B64_ENV)} chars — decoding...", flush=True)
     import base64
     _tmp_cookies_path = os.path.join(tempfile.gettempdir(), "yt_dlp_cookies.txt")
     try:
@@ -111,18 +112,14 @@ if _COOKIES_B64_ENV:
         with open(_tmp_cookies_path, "w", encoding="utf-8") as _f:
             _f.write(_decoded if _decoded.endswith("\n") else _decoded + "\n")
         COOKIES_FILE = _tmp_cookies_path
-        # Log how many cookie entries were decoded so it's easy to spot
-        # a corrupted/empty decode in Railway's deploy logs.
         _cookie_lines = [l for l in _decoded.splitlines() if l and not l.startswith("#")]
-        log.info(
-            "Wrote YouTube cookies from YTDLP_COOKIES_B64 to %s (%d cookie entries).",
-            COOKIES_FILE, len(_cookie_lines),
-        )
+        # Use print so this always appears in Railway logs regardless of log level config.
+        print(f"[cookies] Wrote {len(_cookie_lines)} cookie entries to {COOKIES_FILE}", flush=True)
+        log.info("Wrote YouTube cookies from YTDLP_COOKIES_B64 to %s (%d cookie entries).", COOKIES_FILE, len(_cookie_lines))
         if len(_cookie_lines) == 0:
-            log.warning(
-                "YTDLP_COOKIES_B64 decoded to 0 cookie entries — the export may be empty or corrupted."
-            )
-    except Exception:
+            print("[cookies] WARNING: 0 cookie entries decoded — export may be empty or corrupted.", flush=True)
+    except Exception as _exc:
+        print(f"[cookies] ERROR decoding YTDLP_COOKIES_B64: {_exc}", flush=True)
         log.exception(
             "Failed to decode YTDLP_COOKIES_B64 — make sure it's the base64 encoding of the "
             "*whole* cookies.txt file (e.g. `base64 -w0 cookies.txt` on Linux/Mac, or "
