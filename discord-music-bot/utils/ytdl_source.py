@@ -102,11 +102,26 @@ if _COOKIES_B64_ENV:
     import base64
     _tmp_cookies_path = os.path.join(tempfile.gettempdir(), "yt_dlp_cookies.txt")
     try:
-        _decoded = base64.b64decode(_COOKIES_B64_ENV.strip()).decode("utf-8")
+        # Strip ALL whitespace (spaces, newlines, tabs) — Railway's variable
+        # editor sometimes inserts line breaks into long base64 strings, which
+        # causes base64.b64decode to raise a binascii.Error. Removing every
+        # whitespace character first makes the decode robust to any wrapping.
+        _clean_b64 = "".join(_COOKIES_B64_ENV.split())
+        _decoded = base64.b64decode(_clean_b64).decode("utf-8")
         with open(_tmp_cookies_path, "w", encoding="utf-8") as _f:
             _f.write(_decoded if _decoded.endswith("\n") else _decoded + "\n")
         COOKIES_FILE = _tmp_cookies_path
-        log.info("Wrote YouTube cookies from YTDLP_COOKIES_B64 env var to %s", COOKIES_FILE)
+        # Log how many cookie entries were decoded so it's easy to spot
+        # a corrupted/empty decode in Railway's deploy logs.
+        _cookie_lines = [l for l in _decoded.splitlines() if l and not l.startswith("#")]
+        log.info(
+            "Wrote YouTube cookies from YTDLP_COOKIES_B64 to %s (%d cookie entries).",
+            COOKIES_FILE, len(_cookie_lines),
+        )
+        if len(_cookie_lines) == 0:
+            log.warning(
+                "YTDLP_COOKIES_B64 decoded to 0 cookie entries — the export may be empty or corrupted."
+            )
     except Exception:
         log.exception(
             "Failed to decode YTDLP_COOKIES_B64 — make sure it's the base64 encoding of the "
