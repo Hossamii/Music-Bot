@@ -18,7 +18,6 @@ import aiohttp
 import discord
 from discord.ext import commands
 
-from utils import presence_store
 from utils.queue_manager import GuildMusicState, MusicManager, Track
 from utils.ytdl_source import TrackUnavailableError, YTDLSource
 
@@ -26,18 +25,13 @@ log = logging.getLogger("music.cog")
 
 # FFmpeg `-af` equalizer filter graphs for the bassboost command. Boosts low
 # frequencies (~60Hz and ~150Hz) at increasing gain per level — good for
-# heavy/loud tracks. An `alimiter` is chained on at the end of every level
-# above "off": once the gain gets this high, without it the signal clips
-# (crackles/distorts) on bass-heavy sections instead of just sounding
-# louder. `limit=0.9` caps output peaks at 90% of full scale, which leaves
-# just enough headroom to absorb the boost without audibly squashing the
-# rest of the mix.
+# heavy/loud tracks.
 BASS_PRESETS: dict[str, str] = {
     "off": "",
-    "low": "equalizer=f=60:width_type=o:width=2:g=8,equalizer=f=150:width_type=o:width=2:g=4,alimiter=limit=0.9",
-    "medium": "equalizer=f=60:width_type=o:width=2:g=15,equalizer=f=150:width_type=o:width=2:g=8,alimiter=limit=0.9",
-    "high": "equalizer=f=60:width_type=o:width=2:g=22,equalizer=f=150:width_type=o:width=2:g=12,alimiter=limit=0.9",
-    "extreme": "equalizer=f=60:width_type=o:width=2:g=30,equalizer=f=150:width_type=o:width=2:g=16,alimiter=limit=0.85",
+    "low": "equalizer=f=60:width_type=o:width=2:g=4,equalizer=f=150:width_type=o:width=2:g=2",
+    "medium": "equalizer=f=60:width_type=o:width=2:g=8,equalizer=f=150:width_type=o:width=2:g=4",
+    "high": "equalizer=f=60:width_type=o:width=2:g=12,equalizer=f=150:width_type=o:width=2:g=6",
+    "extreme": "equalizer=f=60:width_type=o:width=2:g=18,equalizer=f=150:width_type=o:width=2:g=9",
 }
 BASS_LEVELS = tuple(BASS_PRESETS.keys())
 
@@ -47,9 +41,6 @@ ACTIVITY_TYPES: dict[str, discord.ActivityType] = {
     "watching": discord.ActivityType.watching,
     "competing": discord.ActivityType.competing,
 }
-# Reverse of the above — needed to turn a discord.ActivityType back into the
-# plain string that presence_store.save() persists to disk.
-ACTIVITY_TYPE_NAMES: dict[discord.ActivityType, str] = {v: k for k, v in ACTIVITY_TYPES.items()}
 
 # discord.py's Status enum — this is the colored dot next to the bot's name
 # (separate from ACTIVITY_TYPES above, which is the "Listening to ..." text).
@@ -133,17 +124,10 @@ class Music(commands.Cog):
                 if state.voice_client.is_playing() or state.voice_client.is_paused():
                     return
 
-                # Consumed here (and reset) so it only applies to the track
-                # it was set for — e.g. a bassboost-triggered restart of the
-                # current track — and not to a genuinely different track
-                # that gets picked up after a TrackUnavailableError below.
-                seek = state.pending_seek
-                state.pending_seek = 0.0
-
                 try:
                     stream_url = await YTDLSource.refresh_stream_url(next_track)
                     audio_filter = BASS_PRESETS.get(state.bass_level, "")
-                    source = YTDLSource.build_audio_source(stream_url, state.volume, audio_filter, start_at=seek)
+                    source = YTDLSource.build_audio_source(stream_url, state.volume, audio_filter)
                 except TrackUnavailableError as exc:
                     await self._notify(state, f"Skipping **{next_track.title}** — {exc}")
                     continue
@@ -163,7 +147,6 @@ class Music(commands.Cog):
 
                 try:
                     state.voice_client.play(source, after=_after)
-                    state.start_playback(offset=seek)
                 except discord.opus.OpusNotLoaded:
                     log.exception(
                         "libopus is not loaded — voice playback cannot start. "
@@ -204,30 +187,12 @@ class Music(commands.Cog):
         they're in — this isn't a per-guild setting (that's a platform
         limitation). Re-sends the current status (online/idle/dnd/offline)
         alongside it, so this never silently resets a status set via
-        `setpresence` back to the online default.
-
-        IMPORTANT: the "current status" is read from presence_store, NOT
-        from `self.bot.status`. discord.py has a known bug/quirk
-        (Rapptz/discord.py#9440, closed "as designed") where `bot.status`
-        is never updated locally by `change_presence()` — it stays stuck
-        at its last-known value (usually `online`) even after a status
-        change succeeds on Discord's side. Relying on it here would silently
-        reset `setpresence idle` back to online the next time `setstatus`
-        (or anything else calling this) ran. presence_store is the actual
-        source of truth since it's updated in lockstep with every
-        successful `change_presence()` call."""
-        saved_status = presence_store.load()["status"]
-        current_status = STATUS_PRESETS.get(saved_status, discord.Status.online)
+        `setpresence` back to the online default."""
         activity = discord.Activity(type=activity_type, name=text or "play <song>")
         try:
-            await self.bot.change_presence(status=current_status, activity=activity)
+            await self.bot.change_presence(status=self.bot.status, activity=activity)
         except discord.HTTPException:
             log.warning("Failed to update bot presence")
-            return
-        presence_store.save(
-            activity_type=ACTIVITY_TYPE_NAMES.get(activity_type, "listening"),
-            activity_text=text or "play <song>",
-        )
 
     async def _update_nickname(self, guild: discord.Guild | None, nick: str | None) -> None:
         """Update the bot's nickname in a single guild. Passing nick=None
@@ -324,7 +289,6 @@ class Music(commands.Cog):
             await ctx.send("Nothing is playing.")
             return
         state.voice_client.pause()
-        state.mark_paused()
         await ctx.send("Paused.")
 
     @commands.command(name="resume")
@@ -335,7 +299,6 @@ class Music(commands.Cog):
             await ctx.send("Nothing is paused.")
             return
         state.voice_client.resume()
-        state.mark_resumed()
         await ctx.send("Resumed.")
 
     @commands.command(name="skip")
@@ -421,18 +384,12 @@ class Music(commands.Cog):
             state.voice_client.is_playing() or state.voice_client.is_paused()
         )
         if currently_playing and state.current:
-            # FFmpeg can't change its filter graph mid-stream, so a restart
-            # is unavoidable — but we can seek the new source back to
-            # roughly where the old one was, instead of starting over from
-            # 0:00. Clamp to the track's known duration (if any) so a
-            # slightly-stale estimate can never seek past the end.
-            seek_to = state.elapsed_seconds()
-            if state.current.duration:
-                seek_to = min(seek_to, max(state.current.duration - 1, 0))
-            state.pending_seek = seek_to
+            # Restart the current track with the new filter applied. This
+            # restarts from the beginning — FFmpeg can't resume mid-stream
+            # once the filter graph changes.
             state.queue.appendleft(state.current)
-            state.voice_client.stop()  # triggers `after` -> replays the requeued track, seeked to `pending_seek`
-            await ctx.send(f"Bass boost set to **{level}**. Picking back up from where it was.")
+            state.voice_client.stop()  # triggers `after` -> plays the requeued track
+            await ctx.send(f"Bass boost set to **{level}**. Restarting the current track from the top to apply it.")
         else:
             await ctx.send(f"Bass boost set to **{level}**. It'll apply to the next track played.")
 
@@ -470,18 +427,12 @@ class Music(commands.Cog):
             await ctx.send(f"Usage: `setpresence <{'/'.join(STATUS_PRESETS)}>`")
             return
         state = state.lower()
-        saved = presence_store.load()
-        current_activity = discord.Activity(
-            type=ACTIVITY_TYPES.get(saved["activity_type"], discord.ActivityType.listening),
-            name=saved["activity_text"],
-        )
         try:
-            await self.bot.change_presence(status=STATUS_PRESETS[state], activity=current_activity)
+            await self.bot.change_presence(status=STATUS_PRESETS[state], activity=self.bot.activity)
         except discord.HTTPException:
             log.warning("Failed to update bot presence status")
             await ctx.send("Couldn't update the status right now. Try again in a bit.")
             return
-        presence_store.save(status=state)
         note = " (Discord has no true offline state for bots — this makes it appear offline.)" if state == "offline" else ""
         await ctx.send(f"Bot presence set to **{state}**.{note} (Shared across every server the bot is in.)")
 
